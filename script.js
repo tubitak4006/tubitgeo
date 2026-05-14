@@ -377,12 +377,16 @@
 
     /* ------------------------------------------------------
        3. Form handling — registration + login
-          Backed by Firebase Firestore (cross-device, like a
-          real backend). Accounts and per-user "work" (functions
-          drawn on the graph) are stored remotely.
+          Backed by localStorage (per-device).
+          Same device can only register a given identity once;
+          but two different devices can register the same name
+          (they are independent stores).
        ------------------------------------------------------ */
 
-    /* ---- Account identity (no PII in the doc id) ---------- */
+    /* ---- Storage layer (localStorage) --------------------- */
+    const ACCOUNTS_KEY = 'gck:accounts';
+    const WORK_KEY_PREFIX = 'gck:work:';
+
     function accountId(acc) {
         // unique key for each student (case-insensitive)
         return [
@@ -393,20 +397,21 @@
         ].join('|');
     }
 
-    /* ---- Database wrappers (thin layer over window.gckDB) -- */
-    async function dbReady() {
-        if (!window.gckDB) throw new Error('Veritabanı kütüphanesi yüklenmedi. Lütfen sayfayı yenileyin.');
-        await window.gckDB.readyPromise;
-        if (!window.gckDB.isReady) {
-            throw new Error('Veritabanına bağlanılamadı. Firebase ayarlarını kontrol edin.');
-        }
+    function loadAccounts() {
+        try {
+            const raw = localStorage.getItem(ACCOUNTS_KEY);
+            return raw ? JSON.parse(raw) : [];
+        } catch { return []; }
     }
-    async function findAccountDB(acc) {
-        await dbReady();
-        return window.gckDB.findAccount(accountId(acc));
+    function saveAccounts(list) {
+        try { localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(list)); }
+        catch (e) { console.warn('Hesap listesi kaydedilemedi:', e); }
     }
-    async function createAccountDB(acc) {
-        await dbReady();
+    function findAccount(acc) {
+        const id = accountId(acc);
+        return loadAccounts().find(a => accountId(a) === id) || null;
+    }
+    function createAccount(acc) {
         const record = {
             ad:            acc.ad,
             soyad:         acc.soyad,
@@ -414,16 +419,30 @@
             sube:          acc.sube,
             createdAt:     new Date().toISOString()
         };
-        await window.gckDB.createAccount(accountId(record), record);
+        const list = loadAccounts();
+        // Defensive: refuse duplicate creation at the storage layer too
+        if (list.some(a => accountId(a) === accountId(record))) {
+            throw new Error('Bu bilgilerle zaten bir hesap var.');
+        }
+        list.push(record);
+        saveAccounts(list);
         return record;
     }
-    async function loadUserWorkDB(acc) {
-        await dbReady();
-        return window.gckDB.loadWork(accountId(acc));
+    function workKeyFor(acc) {
+        return WORK_KEY_PREFIX + accountId(acc);
     }
-    async function saveUserWorkDB(acc, functions) {
-        await dbReady();
-        return window.gckDB.saveWork(accountId(acc), functions);
+    function loadUserWork(acc) {
+        try {
+            const raw = localStorage.getItem(workKeyFor(acc));
+            return raw ? JSON.parse(raw) : null;
+        } catch { return null; }
+    }
+    function saveUserWork(acc, functions) {
+        try {
+            localStorage.setItem(workKeyFor(acc), JSON.stringify(functions));
+        } catch (e) {
+            console.warn('Çalışma kaydedilemedi:', e);
+        }
     }
 
     /* ---- Input filters & validation ----------------------- */
@@ -579,7 +598,7 @@
         }
 
         /* --- REGISTER submit --- */
-        registerForm.addEventListener('submit', async (e) => {
+        registerForm.addEventListener('submit', (e) => {
             e.preventDefault();
             registerError.hidden = true;
 
@@ -595,17 +614,16 @@
             }
 
             const candidate = { ad, soyad, sinifDerecesi: sinif, sube };
-            setSubmitLoading(registerForm, true);
 
             try {
-                const existing = await findAccountDB(candidate);
+                // Block duplicate accounts on THIS device
+                const existing = findAccount(candidate);
                 if (existing) {
-                    showError(registerError, 'Bu bilgilerle zaten kayıt var. Lütfen "Giriş Yap" sekmesini kullanın.');
-                    setSubmitLoading(registerForm, false);
+                    showError(registerError, 'Bu bilgilerle bu cihazda zaten kayıt var. Lütfen "Giriş Yap" sekmesini kullanın.');
                     return;
                 }
 
-                const record = await createAccountDB(candidate);
+                const record = createAccount(candidate);
 
                 // Show success briefly, then redirect to login tab
                 setHidden(registerForm, true);
@@ -622,12 +640,11 @@
             } catch (err) {
                 console.error('Kayıt hatası:', err);
                 showError(registerError, 'Kayıt yapılamadı: ' + (err.message || 'bilinmeyen hata'));
-                setSubmitLoading(registerForm, false);
             }
         });
 
         /* --- LOGIN submit --- */
-        loginForm.addEventListener('submit', async (e) => {
+        loginForm.addEventListener('submit', (e) => {
             e.preventDefault();
             loginError.hidden = true;
 
@@ -643,31 +660,21 @@
             }
 
             const candidate = { ad, soyad, sinifDerecesi: sinif, sube };
-            setSubmitLoading(loginForm, true);
 
             try {
-                const existing = await findAccountDB(candidate);
+                const existing = findAccount(candidate);
                 if (!existing) {
-                    showError(loginError, 'Bu bilgilerle kayıtlı bir hesap bulunamadı. "Kayıt Ol" sekmesinden hesap oluşturabilirsin.');
-                    setSubmitLoading(loginForm, false);
+                    showError(loginError, 'Bu bilgilerle bu cihazda kayıtlı bir hesap bulunamadı. "Kayıt Ol" sekmesinden hesap oluşturabilirsin.');
                     return;
                 }
 
-                // Load this user's saved work, then transition into the workspace
-                let savedWork = null;
-                try {
-                    savedWork = await loadUserWorkDB(existing);
-                } catch (e) {
-                    console.warn('Çalışma yüklenemedi:', e);
-                }
+                const savedWork = loadUserWork(existing);
 
-                if (loginBanner) loginBanner.hidden = true;
-                setSubmitLoading(loginForm, false);
+                if (loginBanner) setHidden(loginBanner, true);
                 transitionToWorkspace(existing, savedWork);
             } catch (err) {
                 console.error('Giriş hatası:', err);
                 showError(loginError, 'Giriş yapılamadı: ' + (err.message || 'bilinmeyen hata'));
-                setSubmitLoading(loginForm, false);
             }
         });
 
@@ -706,11 +713,11 @@
         });
     }
 
-    async function transitionToLanding() {
+    function transitionToLanding() {
         // Save current user's work before leaving (best-effort)
         if (currentWorkUser && workspaceController && workspaceController.snapshotFunctions) {
             try {
-                await saveUserWorkDB(currentWorkUser, workspaceController.snapshotFunctions());
+                saveUserWork(currentWorkUser, workspaceController.snapshotFunctions());
             } catch (e) {
                 console.warn('Çalışma çıkıştan önce kaydedilemedi:', e);
             }
@@ -1346,18 +1353,18 @@
             fnEmpty.classList.toggle('is-hidden', plotter.functions.length > 0);
         }
 
-        // Persist current functions for the logged-in user (Firebase, debounced)
+        // Persist current functions for the logged-in user (localStorage, debounced)
         let persistTimer = null;
         function persistWork() {
             if (!currentWorkUser) return;
             clearTimeout(persistTimer);
-            persistTimer = setTimeout(async () => {
+            persistTimer = setTimeout(() => {
                 try {
-                    await saveUserWorkDB(currentWorkUser, snapshotFunctions());
+                    saveUserWork(currentWorkUser, snapshotFunctions());
                 } catch (e) {
                     console.warn('Çalışma kaydedilemedi:', e);
                 }
-            }, 600);
+            }, 400);
         }
 
         // Take a snapshot of the current functions (serializable)
